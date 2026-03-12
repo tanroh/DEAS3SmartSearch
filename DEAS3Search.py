@@ -16,7 +16,6 @@ import requests
 import boto3
 import pandas as pd
 import folium
-import time
 import streamlit as st
 from datetime import datetime, timedelta
 from botocore import UNSIGNED
@@ -168,49 +167,34 @@ def get_ai_client():
     return anthropic.Anthropic(api_key=api_key)
 
 # ── Geocoding ─────────────────────────────────────────────────────────────────
-
 @st.cache_data(ttl=3600, show_spinner=False)
 def geocode_place(place_name: str, buffer_deg: float = 0.5) -> dict:
-    """Convert a place name to a WGS84 bounding box via Nominatim REST API."""
-    data = []
-    for attempt in range(3):
-        try:
-            resp = requests.get(
-                "https://nominatim.openstreetmap.org/search",
-                params={
-                    "q": place_name + ", Australia",
-                    "format": "json",
-                    "limit": 1,
-                    "addressdetails": 0,
-                },
-                headers={"User-Agent": "dea-streamlit-search/1.0 rohan.tankey@gmail.com"},
-                timeout=10,
-            )
-            if resp.status_code == 429:
-                time.sleep(2 ** attempt)  # 1s, 2s, 4s backoff
-                continue
-            resp.raise_for_status()
-            data = resp.json()
-            break
-        except requests.RequestException as e:
-            if attempt == 2:
-                raise RuntimeError(f"Geocoding failed after 3 attempts: {e}")
-            time.sleep(2 ** attempt)
+    """Convert a place name to a WGS84 bounding box via Nominatim."""
+    geolocator = get_geocoder()
+    try:
+        location = geolocator.geocode(
+            place_name + ", Australia",
+            exactly_one=True,
+            timeout=10,
+        )
+    except GeocoderTimedOut:
+        raise RuntimeError(f'Geocoder timed out for "{place_name}"')
 
-    if not data:
+    if not location:
         raise ValueError(f'Could not geocode "{place_name}"')
 
-    g = data[0]
-    centroid = [float(g["lon"]), float(g["lat"])]
-    if "boundingbox" in g:
-        s, n, w, e = [float(v) for v in g["boundingbox"]]
+    raw = location.raw
+    centroid = [location.longitude, location.latitude]
+
+    if "boundingbox" in raw:
+        s, n, w, e = [float(v) for v in raw["boundingbox"]]
         bbox = [w, s, e, n]
     else:
         lon, lat = centroid
         bbox = [lon - buffer_deg, lat - buffer_deg,
                 lon + buffer_deg, lat + buffer_deg]
 
-    return {"place": g.get("display_name", place_name), "bbox": bbox, "centroid": centroid}
+    return {"place": location.address, "bbox": bbox, "centroid": centroid}
 
 # ── Claude question parser ────────────────────────────────────────────────────
 SYSTEM_PROMPT = (
