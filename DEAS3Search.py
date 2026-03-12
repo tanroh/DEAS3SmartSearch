@@ -1,801 +1,320 @@
 """
-DEA S3 Smart Search — Streamlit App
-====================================
-A portable, self-contained web app for searching Digital Earth Australia
-satellite data via natural language questions.
-
-Run with:
-    streamlit run app.py
-
-Requires ANTHROPIC_API_KEY in environment (or .env file / Streamlit secrets).
+NASA Astrophysics Data Explorer
+Browses JWST and TESS data via the MAST archive (astroquery)
 """
 
-import ast
-import os
-import re
-import json
-import time
-import requests
-import boto3
-import pandas as pd
-import folium
 import streamlit as st
-from datetime import datetime, timedelta
-from botocore import UNSIGNED
-from botocore.config import Config
-from streamlit_folium import st_folium
-import anthropic
+import pandas as pd
+from astroquery.mast import Observations
+from astropy.coordinates import SkyCoord
+import astropy.units as u
+from PIL import Image
+import requests
+from io import BytesIO
+import lightkurve as lk
+import matplotlib.pyplot as plt
+import warnings
+warnings.filterwarnings("ignore")
 
-# ── Page config ───────────────────────────────────────────────────────────────
+# ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="DEA S3 Search",
-    page_icon="🛰️",
+    page_title="NASA Astrophysics Explorer",
+    page_icon="🔭",
     layout="wide",
-    initial_sidebar_state="expanded",
 )
 
-# ── Constants ─────────────────────────────────────────────────────────────────
-S3_BUCKET     = "dea-public-data"
-S3_REGION     = "ap-southeast-2"
-STAC_ENDPOINT = "https://explorer.dea.ga.gov.au/stac/"
-S3_HTTP_BASE  = f"https://{S3_BUCKET}.s3.{S3_REGION}.amazonaws.com"
+st.title("🔭 NASA Astrophysics Explorer")
+st.caption("Browse JWST and TESS observations via the MAST archive")
 
-os.environ["AWS_NO_SIGN_REQUEST"] = "YES"
+# ── Sidebar controls ─────────────────────────────────────────────────────────
+with st.sidebar:
+    st.header("Search")
 
-# ── DEA Collection catalogue ──────────────────────────────────────────────────
-DEA_COLLECTIONS = [
-    {
-        "id": "ga_ls8c_ard_3",
-        "sensor": "Landsat 8",
-        "title": "Landsat 8 ARD",
-        "description": "Surface reflectance ARD. Use for vegetation, land cover, change detection, NDVI, agriculture, drought, bushfire burn severity.",
-        "tags": ["vegetation","land cover","change detection","NDVI","agriculture","drought","reflectance","landsat","bushfire","burn","fire"],
-        "temporal": "2013–present",
-        "resolution": "30m",
-    },
-    {
-        "id": "ga_ls9c_ard_3",
-        "sensor": "Landsat 9",
-        "title": "Landsat 9 ARD",
-        "description": "Continuation of Landsat 8 mission from 2022 onward.",
-        "tags": ["vegetation","land cover","recent","2022","2023","2024","landsat","bushfire","burn","fire"],
-        "temporal": "2022–present",
-        "resolution": "30m",
-    },
-    {
-        "id": "ga_s2am_ard_3",
-        "sensor": "Sentinel-2A",
-        "title": "Sentinel-2A ARD",
-        "description": "High-resolution (10m) surface reflectance. Better spatial detail than Landsat.",
-        "tags": ["high resolution","urban","coastal","agriculture","detail","sentinel","bushfire","burn","fire"],
-        "temporal": "2017–present",
-        "resolution": "10m",
-    },
-    {
-        "id": "ga_s2bm_ard_3",
-        "sensor": "Sentinel-2B",
-        "title": "Sentinel-2B ARD",
-        "description": "Paired with 2A for ~5-day revisit at 10m resolution.",
-        "tags": ["high resolution","urban","coastal","agriculture","detail","sentinel","bushfire","burn","fire"],
-        "temporal": "2017–present",
-        "resolution": "10m",
-    },
-    {
-        "id": "ga_ls_wo_3",
-        "sensor": "Landsat",
-        "title": "Water Observations (WOfS)",
-        "description": "Detects water presence. Use for flood mapping, wetland monitoring, reservoir tracking.",
-        "tags": ["water","flood","wetland","inundation","reservoir","drought","river","lake"],
-        "temporal": "1986–present",
-        "resolution": "30m",
-    },
-    {
-        "id": "ga_ls_fc_3",
-        "sensor": "Landsat",
-        "title": "Fractional Cover",
-        "description": "Estimates ground cover as fractions of green vegetation, non-green vegetation, and bare soil.",
-        "tags": ["vegetation","bare soil","ground cover","pasture","grazing","land degradation","agriculture","drought"],
-        "temporal": "1986–present",
-        "resolution": "30m",
-    },
-    {
-        "id": "ga_ls_tcw_percentiles_2",
-        "sensor": "Landsat",
-        "title": "Tasseled Cap Wetness",
-        "description": "Summarises landscape wetness over time. Useful for identifying persistently wet areas.",
-        "tags": ["wetness","moisture","seasonal","vegetation stress","time series"],
-        "temporal": "1986–present",
-        "resolution": "30m",
-    },
-    {
-        "id": "ga_srtm_dem1sv1_0",
-        "sensor": "SRTM",
-        "title": "Digital Elevation Model",
-        "description": "Elevation from the Shuttle Radar Topography Mission. Use for terrain, flood modelling, hydrology.",
-        "tags": ["elevation","DEM","terrain","flood modelling","slope","topography","hydrology"],
-        "temporal": "2000 (static)",
-        "resolution": "30m",
-    },
-    {
-        "id": "ga_ls_landcover_class_cyear_2",
-        "sensor": "Landsat",
-        "title": "DEA Land Cover",
-        "description": "Annual land cover classification. Detects changes in land use across Australia.",
-        "tags": ["land cover","land use","classification","urban","forest","clearing","change"],
-        "temporal": "1988–present",
-        "resolution": "30m",
-    },
-    {
-        "id": "ga_ls_mangrove_cover_cyear_3",
-        "sensor": "Landsat",
-        "title": "Mangrove Cover",
-        "description": "Annual mapping of mangrove extent and canopy cover around Australian coastlines.",
-        "tags": ["mangrove","coastal","wetland","canopy","intertidal","marine"],
-        "temporal": "1987–present",
-        "resolution": "30m",
-    },
-]
-
-EXAMPLE_QUESTIONS = [
-    "Which areas in the Riverina had standing water after the 2022 floods?",
-    "Show me vegetation stress across the Murray-Darling Basin in summer 2023",
-    "Before and after scenes of the 2019-20 Black Summer fires in East Gippsland",
-    "How has urban extent changed in Greater Western Sydney since 2018?",
-    "Get mangrove cover data along the Gulf of Carpentaria for the last 5 years",
-    "Show elevation data for flood-prone areas near Lismore",
-    "Detect surface disturbance near mine sites in the Pilbara in 2023",
-    "Find areas in the QPRC LGA affected by 2022 bushfires",
-]
-
-# ── Cached clients ────────────────────────────────────────────────────────────
-@st.cache_resource
-def get_s3_client():
-    return boto3.client(
-        "s3",
-        region_name=S3_REGION,
-        config=Config(signature_version=UNSIGNED),
+    target_input = st.text_input(
+        "Object name or RA Dec",
+        value="NGC 628",
+        help="Examples:  NGC 628  |  M31  |  261.7 -73.5  |  Trappist-1",
     )
 
-@st.cache_resource
-def get_ai_client():
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        return None
-    return anthropic.Anthropic(api_key=api_key)
+    search_mode = st.radio(
+        "Resolve target as",
+        ["Object name", "RA / Dec (degrees)"],
+        index=0,
+    )
 
-# ── Geocoding ─────────────────────────────────────────────────────────────────
-def _build_query_variants(place_name: str) -> list:
-    """Return query strings to try, from most to least specific."""
-    variants = [place_name]
-    if not place_name.lower().endswith("australia"):
-        variants.append(place_name + ", Australia")
-    # Strip suffixes that confuse geocoders
-    stripped = re.sub(
-        r'\b(Regional Council|City Council|Shire Council|Council|'
-        r'Local Government Area|LGA|Shire|Region|District)\b',
-        "", place_name, flags=re.IGNORECASE,
-    ).strip(" ,")
-    if stripped and stripped.lower() != place_name.lower():
-        variants.append(stripped)
-        variants.append(stripped + ", Australia")
-    return variants
+    missions = st.multiselect(
+        "Missions",
+        ["JWST", "TESS"],
+        default=["JWST", "TESS"],
+    )
 
+    radius_arcmin = st.slider("Search radius (arcmin)", 1, 60, 3)
 
-def _geocode_geoapify(place_name: str, api_key: str) -> dict:
-    """Try Geoapify geocoding API. Returns result dict or None."""
-    for query in _build_query_variants(place_name):
+    max_results = st.slider("Max results per mission", 10, 200, 50)
+
+    run_search = st.button("🔍 Search", use_container_width=True)
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+# Solar system bodies astropy can resolve via ephemeris
+SOLAR_SYSTEM_BODIES = {
+    "mercury", "venus", "mars", "jupiter", "saturn", "uranus", "neptune",
+    "pluto", "moon", "sun", "io", "europa", "ganymede", "callisto",
+    "titan", "enceladus", "triton", "ceres", "eris",
+}
+
+@st.cache_data(show_spinner=False)
+def resolve_target(target_str: str, mode: str):
+    """Return a SkyCoord from a name or 'ra dec' string."""
+    if mode == "Object name":
+        # Check for solar system bodies first — SIMBAD won't have these
+        if target_str.strip().lower() in SOLAR_SYSTEM_BODIES:
+            from astropy.coordinates import get_body_barycentric
+            from astropy.time import Time
+            from astropy.coordinates import solar_system_ephemeris, ICRS
+            import astropy.coordinates as coord_module
+            with solar_system_ephemeris.set("builtin"):
+                body = coord_module.get_body(target_str.strip().lower(), Time.now())
+            coord = SkyCoord(ra=body.ra, dec=body.dec, frame="icrs")
+            return coord
+
+        # Try CDS Sesame (handles stars, galaxies, nebulae, exoplanet hosts)
         try:
-            resp = requests.get(
-                "https://api.geoapify.com/v1/geocode/search",
-                params={
-                    "text": query,
-                    "filter": "countrycode:au",
-                    "limit": 1,
-                    "apiKey": api_key,
-                },
-                timeout=10,
-            )
-            resp.raise_for_status()
-            features = resp.json().get("features", [])
-            if features:
-                f = features[0]
-                props = f["properties"]
-                lon, lat = f["geometry"]["coordinates"]
-                bb = props.get("bbox")
-                if bb:
-                    bbox = [bb[0], bb[1], bb[2], bb[3]]
-                else:
-                    bbox = [lon - 0.5, lat - 0.5, lon + 0.5, lat + 0.5]
-                return {
-                    "place":    props.get("formatted", place_name),
-                    "bbox":     bbox,
-                    "centroid": [lon, lat],
-                }
+            coord = SkyCoord.from_name(target_str)
+            return coord
         except Exception:
             pass
-    return None
 
-
-def _geocode_nominatim(place_name: str) -> dict:
-    """Try Nominatim with retries and backoff. Returns result dict or None."""
-    for query in _build_query_variants(place_name):
-        for attempt in range(3):
-            try:
-                resp = requests.get(
-                    "https://nominatim.openstreetmap.org/search",
-                    params={"q": query, "format": "json", "limit": 1,
-                            "addressdetails": 0, "countrycodes": "au"},
-                    headers={"User-Agent": "dea-streamlit-search/1.0 rohan.tankey@gmail.com"},
-                    timeout=10,
-                )
-                if resp.status_code == 429:
-                    time.sleep(2 ** attempt)
-                    continue
-                resp.raise_for_status()
-                data = resp.json()
-                if data:
-                    g = data[0]
-                    lon, lat = float(g["lon"]), float(g["lat"])
-                    if "boundingbox" in g:
-                        s, n, w, e = [float(v) for v in g["boundingbox"]]
-                        bbox = [w, s, e, n]
-                    else:
-                        bbox = [lon - 0.5, lat - 0.5, lon + 0.5, lat + 0.5]
-                    return {
-                        "place":    g.get("display_name", place_name),
-                        "bbox":     bbox,
-                        "centroid": [lon, lat],
-                    }
-            except requests.RequestException:
-                if attempt == 2:
-                    break
-                time.sleep(2 ** attempt)
-    return None
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def geocode_place(place_name: str) -> dict:
-    """
-    Convert a place name to a WGS84 bounding box.
-    Tries Geoapify first (if GEOAPIFY_API_KEY secret is set), falls back to Nominatim.
-    Add GEOAPIFY_API_KEY to Streamlit Secrets for reliable geocoding of Australian LGAs.
-    Free tier: https://www.geoapify.com/ (3,000 requests/day, no rate limiting issues).
-    """
-    geoapify_key = os.environ.get("GEOAPIFY_API_KEY", "")
-
-    result = _geocode_geoapify(place_name, geoapify_key) if geoapify_key else None
-
-    if result is None:
-        result = _geocode_nominatim(place_name)
-
-    if result is None:
-        raise ValueError(
-            f'Could not geocode "{place_name}". '
-            "Add GEOAPIFY_API_KEY to Streamlit Secrets for more reliable geocoding "
-            "(free at geoapify.com — handles Australian LGAs and place names well)."
-        )
-
-    return result
-
-# ── Claude question parser ────────────────────────────────────────────────────
-SYSTEM_PROMPT = (
-    "You are a geospatial assistant for Digital Earth Australia (DEA). "
-    "Extract search parameters from the user's question. "
-    "Respond ONLY with valid JSON — no markdown fences, no commentary:\n"
-    "{\n"
-    '  "place_name": "<full resolvable place name — ALWAYS expand acronyms and abbreviations '
-    'to their full geocodable form. Examples: QPRC -> Queanbeyan-Palerang, '
-    'MDB -> Murray-Darling Basin, SEQ -> South East Queensland, '
-    'FNQ -> Far North Queensland, SWWA -> South West Western Australia, '
-    'ACT -> Australian Capital Territory, NQ -> North Queensland. '
-    'Drop suffixes that confuse geocoders: LGA, Local Government Area, '
-    'Regional Council, City Council, Shire Council. '
-    'Return null if no location is mentioned.>",\n'
-    '  "start_date": "<YYYY-MM-DD>",\n'
-    '  "end_date": "<YYYY-MM-DD>",\n'
-    '  "collections": ["<collection_id>"],\n'
-    '  "max_cloud_pct": <0-100>,\n'
-    '  "reasoning": "<one sentence>"\n'
-    "}\n"
-    "Rules:\n"
-    "- ALWAYS expand location acronyms/abbreviations to their full geocodable name\n"
-    "- ALWAYS drop administrative suffixes: LGA, Local Government Area, Regional Council, "
-    "City Council, Shire Council\n"
-    "- If no specific location is mentioned, set place_name to null\n"
-    "- Pick 1-2 most relevant collection IDs from the catalogue provided\n"
-    "- Default to last 12 months if no date mentioned\n"
-    "- For water/flood questions set max_cloud_pct=10\n"
-    "- For bushfire/burn questions use Landsat or Sentinel ARD, set max_cloud_pct=20\n"
-    "- For DEM/elevation set max_cloud_pct=100\n"
-    f"- Today: {datetime.now().strftime('%Y-%m-%d')}"
-)
-
-
-def parse_question_with_claude(question: str) -> dict:
-    """Use Claude to parse a natural language question into search params."""
-    ai = get_ai_client()
-    if not ai:
-        raise RuntimeError("ANTHROPIC_API_KEY not set")
-
-    catalogue_json = json.dumps(
-        [{"id": c["id"], "title": c["title"], "description": c["description"], "tags": c["tags"]}
-         for c in DEA_COLLECTIONS],
-        indent=2,
-    )
-    user_msg = f"Question: {question}\n\nAvailable DEA collections:\n{catalogue_json}"
-
-    response = ai.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=512,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_msg}],
-    )
-    raw = response.content[0].text.strip()
-    return json.loads(raw)
-
-
-def parse_question_local(question: str) -> dict:
-    """Keyword-based fallback parser (no API key needed)."""
-    q = question.lower()
-    now = datetime.now()
-
-    m = re.search(r"\b(20\d{2})(?:[–\-](20\d{2}))?\b", q)
-    if m:
-        y1 = int(m.group(1))
-        y2 = int(m.group(2)) if m.group(2) else y1
-        start_date, end_date = f"{y1}-01-01", f"{y2}-12-31"
-    elif "last 5 year" in q:
-        start_date = f"{now.year - 5}-01-01"
-        end_date = now.strftime("%Y-%m-%d")
-    elif "last year" in q:
-        start_date = f"{now.year - 1}-01-01"
-        end_date = f"{now.year - 1}-12-31"
-    else:
-        start_date = (now - timedelta(days=365)).strftime("%Y-%m-%d")
-        end_date = now.strftime("%Y-%m-%d")
-
-    scored = []
-    for col in DEA_COLLECTIONS:
-        score = sum(2 for tag in col["tags"] if tag.lower() in q)
-        if col["sensor"].lower() in q:
-            score += 5
-        scored.append((score, col["id"]))
-    scored.sort(reverse=True)
-    collections = [scored[0][1]] if scored[0][0] == 0 else [c for s, c in scored[:2] if s > 0]
-
-    max_cloud = (10 if any(w in q for w in ["water", "flood"])
-                 else 100 if any(w in q for w in ["elevation", "dem", "terrain"])
-                 else 20)
-
-    # Extract place name: find the longest capitalised multi-word phrase
-    stopwords = {"Find","Show","Get","Track","Detect","Which","How","Before","After","Areas","Using"}
-    candidates = re.findall(
-        r'\b([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*(?:\s+(?:LGA|NSW|VIC|QLD|SA|WA|TAS|NT|ACT))?)\b',
-        question
-    )
-    candidates = [p for p in candidates if p not in stopwords and len(p) > 3]
-    place_name = max(candidates, key=len) if candidates else None
-
-    return {
-        "place_name":   place_name,
-        "start_date":   start_date,
-        "end_date":     end_date,
-        "collections":  collections,
-        "max_cloud_pct": max_cloud,
-        "reasoning":    "Matched by keyword analysis (local fallback — no API key).",
-    }
-
-
-def parse_question(question: str) -> dict:
-    """Parse question with Claude, falling back to local parser if unavailable."""
-    try:
-        return parse_question_with_claude(question)
-    except Exception:
-        return parse_question_local(question)
-
-# ── STAC search ───────────────────────────────────────────────────────────────
-def stac_search(collection: str, bbox: list, start_date: str, end_date: str,
-                max_results: int = 100) -> list:
-    resp = requests.post(
-        f"{STAC_ENDPOINT}search",
-        json={
-            "collections": [collection],
-            "bbox": bbox,
-            "datetime": f"{start_date}/{end_date}",
-            "limit": max_results,
-        },
-        timeout=30,
-    )
-    resp.raise_for_status()
-    return resp.json().get("features", [])
-
-
-def _to_https(href: str) -> str:
-    """Convert an s3:// href to a public HTTPS URL."""
-    if href.startswith("s3://"):
-        return href.replace(f"s3://{S3_BUCKET}/", f"{S3_HTTP_BASE}/")
-    return href
-
-
-def get_thumbnail_url(feature: dict) -> str:
-    """
-    Extract the thumbnail HTTPS URL from a STAC feature.
-    DEA uses the asset key 'thumbnail'; falls back to checking roles.
-    Returns None if not available.
-    """
-    try:
-        assets = feature.get("assets", {})
-        # Try the standard 'thumbnail' key first
-        for key in ("thumbnail", "overview"):
-            if key in assets:
-                href = assets[key].get("href", "")
-                if href:
-                    return _to_https(href)
-        # Fall back: find any asset with role 'thumbnail'
-        for asset in assets.values():
-            if "thumbnail" in asset.get("roles", []):
-                href = asset.get("href", "")
-                if href:
-                    return _to_https(href)
-    except Exception:
-        pass
-    return None
-
-
-def build_asset_index(features: list, collection_id: str) -> pd.DataFrame:
-    rows = []
-    for feat in features:
-        item_id       = feat["id"]
-        dt            = feat["properties"].get("datetime", "")
-        cloud         = feat["properties"].get("eo:cloud_cover")
-        bbox          = feat.get("bbox", [])
-        thumbnail_url = get_thumbnail_url(feat)
-        for asset_name, asset in feat.get("assets", {}).items():
-            href = asset.get("href", "")
-            https_url = _to_https(href)
-            rows.append({
-                "item_id":       item_id,
-                "datetime":      dt[:10] if dt else "",
-                "collection":    collection_id,
-                "cloud_pct":     cloud,
-                "asset":         asset_name,
-                "media_type":    asset.get("type", ""),
-                "s3_href":       href,
-                "https_url":     https_url,
-                "thumbnail_url": thumbnail_url,
-                "bbox_str":      str(bbox),
-            })
-    return pd.DataFrame(rows)
-
-
-def run_search(params: dict, bbox: list, max_results: int = 50) -> pd.DataFrame:
-    frames = []
-    for coll_id in params["collections"]:
-        features = stac_search(coll_id, bbox,
-                               params["start_date"], params["end_date"],
-                               max_results=max_results)
-        if not features:
-            continue
-        df = build_asset_index(features, coll_id)
-        if params["max_cloud_pct"] < 100:
-            df = df[df["cloud_pct"].isna() | (df["cloud_pct"] <= params["max_cloud_pct"])]
-        frames.append(df)
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-
-# ── Map helper ────────────────────────────────────────────────────────────────
-def make_map(bbox: list, results: pd.DataFrame = None) -> folium.Map:
-    west, south, east, north = bbox
-    centre = [(south + north) / 2, (west + east) / 2]
-    m = folium.Map(location=centre, zoom_start=7, tiles="CartoDB dark_matter")
-
-    folium.Rectangle(
-        bounds=[[south, west], [north, east]],
-        color="#5fd85f", weight=2, fill=True, fill_opacity=0.05,
-    ).add_to(m)
-
-    if results is not None and not results.empty:
-        seen = set()
-        for _, row in results.iterrows():
-            if row["item_id"] in seen:
-                continue
-            seen.add(row["item_id"])
-            try:
-                b = ast.literal_eval(row["bbox_str"])
-                if len(b) == 4:
-                    w2, s2, e2, n2 = b
-                    cloud_tip = (f"<br>☁ {row['cloud_pct']:.0f}%"
-                                 if row["cloud_pct"] is not None else "")
-                    folium.Rectangle(
-                        bounds=[[s2, w2], [n2, e2]],
-                        color="#3a9e6e", weight=1,
-                        fill=True, fill_opacity=0.08,
-                        tooltip=f"{row['item_id']}<br>{row['datetime']}{cloud_tip}",
-                    ).add_to(m)
-            except Exception:
-                pass
-    return m
-
-# ── Sidebar ───────────────────────────────────────────────────────────────────
-def render_sidebar(active_collection_ids: list = None):
-    with st.sidebar:
-        st.markdown("## 🛰️ DEA Collections")
-        for col in DEA_COLLECTIONS:
-            active = bool(active_collection_ids and col["id"] in active_collection_ids)
-            bg     = "background-color:#1a3a1a;" if active else ""
-            border = "border-left:3px solid #5fd85f;" if active else "border-left:3px solid #2a3a2a;"
-            weight = "600" if active else "400"
-            colour = "#c8ffc8" if active else "#8aaa8a"
-            st.markdown(
-                f"""<div style='padding:8px 10px;margin-bottom:6px;border-radius:4px;{bg}{border}'>
-                <span style='font-size:13px;font-weight:{weight};color:{colour}'>{col["title"]}</span><br>
-                <span style='font-size:10px;color:#5a7a5a;font-family:monospace'>{col["id"]}</span><br>
-                <span style='font-size:10px;color:#4a6a4a'>{col["resolution"]} · {col["temporal"]}</span>
-                </div>""",
-                unsafe_allow_html=True,
+        # Fallback: SIMBAD directly (column names vary by astroquery version)
+        from astroquery.simbad import Simbad
+        result = Simbad.query_object(target_str)
+        if result is None or len(result) == 0:
+            raise ValueError(
+                f"Could not resolve '{target_str}'. "
+                "Try an exact catalogue name (e.g. 'NGC 628', 'TRAPPIST-1') "
+                "or switch to RA/Dec mode."
             )
-        st.divider()
-        st.markdown("**Links**")
-        st.markdown("- [DEA Explorer](https://explorer.dea.ga.gov.au/)")
-        st.markdown("- [Knowledge Hub](https://knowledge.dea.ga.gov.au/)")
-        st.markdown("- [STAC API](https://explorer.dea.ga.gov.au/stac/)")
+        # Column names differ between astroquery versions: try both cases
+        cols = {c.lower(): c for c in result.colnames}
+        ra_col  = cols.get("ra",  cols.get("ra_d",  None))
+        dec_col = cols.get("dec", cols.get("dec_d", None))
+        if ra_col is None or dec_col is None:
+            raise ValueError(f"Unexpected SIMBAD columns: {result.colnames}")
+        ra_val  = result[ra_col][0]
+        dec_val = result[dec_col][0]
+        # SIMBAD returns sexagesimal strings for RA/Dec; degree columns end in _d
+        if "d" in ra_col.lower():
+            coord = SkyCoord(ra=float(ra_val), dec=float(dec_val), unit=u.deg, frame="icrs")
+        else:
+            coord = SkyCoord(ra=ra_val, dec=dec_val, unit=(u.hourangle, u.deg), frame="icrs")
+    else:
+        parts = target_str.split()
+        if len(parts) != 2:
+            raise ValueError("RA/Dec mode expects exactly two numbers, e.g. '261.7 -73.5'")
+        coord = SkyCoord(ra=float(parts[0]), dec=float(parts[1]), unit=u.deg, frame="icrs")
+    return coord
+
+
+@st.cache_data(show_spinner=False)
+def query_mast(ra_deg: float, dec_deg: float, radius_arcmin: float,
+               mission: str, max_rows: int) -> pd.DataFrame:
+    """Query MAST for observations near a coordinate."""
+    coord = SkyCoord(ra=ra_deg, dec=dec_deg, unit=u.deg, frame="icrs")
+    radius = u.Quantity(radius_arcmin, u.arcmin)
+    obs = Observations.query_region(coord, radius=radius)
+    if obs is None or len(obs) == 0:
+        return pd.DataFrame()
+    # Filter to the requested mission
+    mask = [str(c).upper() == mission.upper() for c in obs["obs_collection"]]
+    obs = obs[mask]
+    if len(obs) == 0:
+        return pd.DataFrame()
+
+    df = obs.to_pandas()
+
+    # Useful columns (keep only what's available)
+    want = [
+        "target_name", "obs_collection", "instrument_name", "filters",
+        "t_exptime", "t_min", "t_max", "em_min", "em_max",
+        "obs_id", "proposal_id", "dataURL", "jpegURL", "s_ra", "s_dec",
+        "calib_level", "dataproduct_type",
+    ]
+    keep = [c for c in want if c in df.columns]
+    df = df[keep].head(max_rows)
+
+    # Human-readable date (t_min is MJD — use astropy Time to avoid overflow)
+    if "t_min" in df.columns:
+        from astropy.time import Time
+        def mjd_to_date(val):
+            try:
+                return Time(float(val), format="mjd").to_datetime().date()
+            except Exception:
+                return None
+        df["obs_date"] = df["t_min"].apply(mjd_to_date)
+
+    return df
+
+
+@st.cache_data(show_spinner=False)
+def fetch_preview(url: str):
+    """Download a JPEG preview image from MAST."""
+    try:
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        return Image.open(BytesIO(r.content))
+    except Exception:
+        return None
+
+
+@st.cache_data(show_spinner=False)
+def search_lightcurve_meta(target_name: str) -> pd.DataFrame:
+    """Return TESS light curve search results as a plain dataframe (cacheable)."""
+    search = lk.search_lightcurve(target_name, mission="TESS", author="SPOC")
+    if len(search) == 0:
+        search = lk.search_lightcurve(target_name, mission="TESS")
+    if len(search) == 0:
+        return pd.DataFrame()
+    return search.table.to_pandas()
+
+def fetch_lightcurve(target_name: str):
+    """Download the first available TESS light curve (not cached — lightkurve objects are not picklable)."""
+    search = lk.search_lightcurve(target_name, mission="TESS", author="SPOC")
+    if len(search) == 0:
+        search = lk.search_lightcurve(target_name, mission="TESS")
+    if len(search) == 0:
+        return None
+    return search[0].download()
+
 
 # ── Main app ──────────────────────────────────────────────────────────────────
-def main():
-    st.markdown("""
-    <style>
-    /* Style example buttons as small pill-shaped tags */
-    section[data-testid="stMain"] div[data-testid="stHorizontalBlock"] button[kind="secondary"] {
-        background: transparent !important;
-        border: 1px solid rgba(150,150,150,0.4) !important;
-        border-radius: 999px !important;
-        font-size: 0.75rem !important;
-        padding: 0.2rem 0.6rem !important;
-        white-space: normal !important;
-        text-align: left !important;
-        line-height: 1.3 !important;
-        height: auto !important;
-        min-height: unset !important;
-    }
-    section[data-testid="stMain"] div[data-testid="stHorizontalBlock"] button[kind="secondary"]:hover {
-        border-color: rgba(150,150,150,0.8) !important;
-        background: rgba(150,150,150,0.08) !important;
-    }
-    </style>
-    """, unsafe_allow_html=True)
 
-    st.title("🛰️ DEA S3 Smart Search")
-    st.caption("Ask a plain English question about the Australian landscape — returns S3 asset URLs.")
+if run_search:
+    # Resolve coordinates
+    with st.spinner("Resolving target…"):
+        try:
+            coord = resolve_target(target_input.strip(), search_mode)
+        except Exception as e:
+            st.error(f"Could not resolve target: {e}")
+            st.stop()
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        st.warning(
-            "⚠️  `ANTHROPIC_API_KEY` not found. "
-            "Using local keyword parser — set the key in Streamlit Secrets for Claude-powered parsing.",
-            icon="🔑",
-        )
+    st.success(
+        f"**{target_input}** → RA {coord.ra.deg:.4f}°, Dec {coord.dec.deg:.4f}°"
+    )
 
-    # ── Input ──
-    # "question_text" is the single source of truth for the text area content.
-    # Example buttons write here then rerun; the text_area key reads from it.
-    if "question_text" not in st.session_state:
-        st.session_state["question_text"] = ""
-
-    # ── Example questions (above the box so clicking feels natural) ──
-    st.caption("Examples — click any to load into the search box:")
-    ex_cols = st.columns(4)
-    for i, ex in enumerate(EXAMPLE_QUESTIONS):
-        label = ex[:52] + ("…" if len(ex) > 52 else "")
-        if ex_cols[i % 4].button(label, key=f"ex_{i}", use_container_width=True):
-            st.session_state["question_text"] = ex
-            st.rerun()
-
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        # key= binds the widget to session_state["question_text"] automatically
-        st.text_area(
-            "Your question",
-            placeholder="e.g. Find areas in the QPRC LGA affected by 2022 bushfires",
-            height=100,
-            label_visibility="collapsed",
-            key="question_text",
-        )
-    with col2:
-        st.markdown("<br>", unsafe_allow_html=True)
-        search_clicked = st.button("🔍 Search", use_container_width=True, type="primary")
-        max_results = st.slider("Max scenes", 5, 100, 20, step=5)
-
-    question = st.session_state["question_text"]
-
-    # ── Run search ──
-    if search_clicked and question.strip():
-        render_sidebar()
-
-        with st.status("Running search…", expanded=True) as status_box:
-
-            # Step 1: parse
-            st.write("🧠 Parsing question…")
-            try:
-                params = parse_question(question)
-            except Exception as e:
-                st.error(f"Parsing failed: {e}")
-                return
-
-            if not params.get("place_name"):
-                st.warning(
-                    "⚠️ Couldn't identify a specific location in your question. "
-                    "Try adding a place name — e.g. 'in the Pilbara' or 'near Broken Hill'."
-                )
-                st.stop()
-
-            st.write(f"📍 Location   : **{params['place_name']}**")
-            st.write(f"📅 Dates      : **{params['start_date']}** → **{params['end_date']}**")
-            st.write(f"🛰  Collections: **{', '.join(params['collections'])}**")
-            st.write(f"☁️  Max cloud  : **{params['max_cloud_pct']}%**")
-            if params.get("reasoning"):
-                st.write(f"💡 _{params['reasoning']}_")
-
-            # Step 2: geocode
-            st.write("🗺  Geocoding location…")
-            try:
-                geo = geocode_place(params["place_name"])
-                bbox = geo["bbox"]
-                st.write(f"✅ `{geo['place']}`")
-                st.write(f"   BBox: `{[round(v, 3) for v in bbox]}`")
-            except Exception as e:
-                st.error(f"Geocoding failed: {e}")
-                return
-
-            # Step 3: STAC search
-            st.write("🔍 Querying STAC API…")
-            try:
-                results = run_search(params, bbox, max_results=max_results)
-            except Exception as e:
-                st.error(f"STAC search failed: {e}")
-                return
-
-            n_scenes = results["item_id"].nunique() if not results.empty else 0
-            n_assets = len(results)
-            st.write(f"✅ Found **{n_scenes} scenes** / **{n_assets} assets**")
-            status_box.update(label="Search complete ✅", state="complete")
-
-        render_sidebar(active_collection_ids=params["collections"])
-
-        if results.empty:
-            st.info("No results found. Try adjusting the date range, cloud cover threshold, or location.")
-            return
-
-        # ── Metrics ──
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Scenes", n_scenes)
-        m2.metric("Assets", n_assets)
-        avg_cloud = results["cloud_pct"].dropna().mean()
-        m3.metric("Avg cloud cover", f"{avg_cloud:.1f}%" if not pd.isna(avg_cloud) else "N/A")
-        m4.metric("Collections", results["collection"].nunique())
-
-        tab_map, tab_table, tab_urls, tab_code = st.tabs(
-            ["🗺 Map", "📋 Table", "🔗 URLs", "📓 Notebook code"]
-        )
-
-        with tab_map:
-            st_folium(make_map(bbox, results), width="100%", height=500, returned_objects=[])
-
-        with tab_table:
-            display_cols = [c for c in
-                            ["item_id","datetime","collection","cloud_pct","asset","media_type"]
-                            if c in results.columns]
-            st.dataframe(
-                results[display_cols].sort_values(["datetime","item_id"]),
-                use_container_width=True, height=400,
+    # ── JWST tab ──────────────────────────────────────────────────────────────
+    if "JWST" in missions:
+        st.subheader("🪐 JWST Observations")
+        with st.spinner("Querying MAST for JWST…"):
+            df_jwst = query_mast(
+                coord.ra.deg, coord.dec.deg,
+                radius_arcmin, "JWST", max_results,
             )
-            st.download_button("⬇️ Download CSV", results.to_csv(index=False),
-                               "dea_results.csv", "text/csv")
 
-        with tab_urls:
-            st.markdown("**HTTPS-accessible S3 asset URLs** — click any filename to open/download.")
-            unique_items = results["item_id"].unique()
-            for item_id in unique_items[:30]:
-                item_rows = results[results["item_id"] == item_id]
-                dt        = item_rows["datetime"].iloc[0]
-                cloud     = item_rows["cloud_pct"].iloc[0]
-                cloud_str = f" · ☁ {cloud:.0f}%" if pd.notna(cloud) else ""
-                thumb_url = item_rows["thumbnail_url"].iloc[0]
+        if df_jwst.empty:
+            st.info("No JWST observations found for this target / radius.")
+        else:
+            st.caption(f"{len(df_jwst)} observations returned")
 
-                with st.expander(f"📦 {item_id}  ({dt}{cloud_str})"):
-                    # ── Thumbnail preview ──
-                    if thumb_url:
-                        try:
-                            resp = requests.head(thumb_url, timeout=5)
-                            if resp.status_code == 200:
-                                col_img, col_links = st.columns([1, 2])
-                                with col_img:
-                                    st.image(thumb_url, caption="Quicklook", use_container_width=True)
-                                with col_links:
-                                    for _, row in item_rows.iterrows():
-                                        url = row["https_url"]
-                                        if url and row["asset"] != "thumbnail":
-                                            st.markdown(f"`{row['asset']:30s}` [{url.split('/')[-1]}]({url})")
-                            else:
-                                st.caption("🖼 Thumbnail not available for this scene.")
-                                for _, row in item_rows.iterrows():
-                                    url = row["https_url"]
-                                    if url:
-                                        st.markdown(f"`{row['asset']:30s}` [{url.split('/')[-1]}]({url})")
-                        except Exception:
-                            st.caption("🖼 Thumbnail could not be loaded.")
-                            for _, row in item_rows.iterrows():
-                                url = row["https_url"]
-                                if url:
-                                    st.markdown(f"`{row['asset']:30s}` [{url.split('/')[-1]}]({url})")
-                    else:
-                        st.caption("🖼 No thumbnail asset for this scene.")
-                        for _, row in item_rows.iterrows():
-                            url = row["https_url"]
-                            if url:
-                                st.markdown(f"`{row['asset']:30s}` [{url.split('/')[-1]}]({url})")
+            # Display columns
+            display_cols = [c for c in [
+                "target_name", "instrument_name", "filters",
+                "t_exptime", "obs_date", "proposal_id", "dataproduct_type", "calib_level",
+            ] if c in df_jwst.columns]
 
-            if len(unique_items) > 30:
-                st.caption(f"Showing first 30 of {len(unique_items)} scenes. Download CSV for all.")
+            st.dataframe(
+                df_jwst[display_cols],
+                use_container_width=True,
+                hide_index=True,
+            )
 
-        with tab_code:
-            st.markdown("**Reproduce this search in Python:**")
-            code = f'''import requests, pandas as pd
+            # Image previews
+            preview_rows = df_jwst[df_jwst["jpegURL"].notna()] if "jpegURL" in df_jwst.columns else pd.DataFrame()
+            if not preview_rows.empty:
+                st.markdown("#### Image Previews")
+                cols = st.columns(4)
+                shown = 0
+                for _, row in preview_rows.iterrows():
+                    if shown >= 8:
+                        break
+                    img = fetch_preview(row["jpegURL"])
+                    if img:
+                        label = f"{row.get('target_name','?')} · {row.get('filters','')}"
+                        cols[shown % 4].image(img, caption=label, use_container_width=True)
+                        shown += 1
+                if shown == 0:
+                    st.info("Preview images not available for these observations.")
 
-S3_BUCKET     = "dea-public-data"
-S3_REGION     = "ap-southeast-2"
-STAC_ENDPOINT = "https://explorer.dea.ga.gov.au/stac/"
-S3_HTTP_BASE  = f"https://{{S3_BUCKET}}.s3.{{S3_REGION}}.amazonaws.com"
+            # Links to MAST portal
+            if "obs_id" in df_jwst.columns:
+                st.markdown("#### Links to MAST Portal")
+                for _, row in df_jwst.head(10).iterrows():
+                    oid = row["obs_id"]
+                    url = f"https://mast.stsci.edu/portal/Mashup/Clients/Mast/Portal.html?searchQuery={oid}"
+                    st.markdown(f"- [{oid}]({url})")
 
-params = {json.dumps({k: v for k, v in params.items() if k != "reasoning"}, indent=4)}
-bbox   = {bbox}
+    # ── TESS tab ──────────────────────────────────────────────────────────────
+    if "TESS" in missions:
+        st.subheader("⭐ TESS Observations")
 
-resp = requests.post(
-    STAC_ENDPOINT + "search",
-    json={{
-        "collections": params["collections"],
-        "bbox": bbox,
-        "datetime": f"{{params['start_date']}}/{{params['end_date']}}",
-        "limit": {max_results},
-    }}
+        with st.spinner("Querying MAST for TESS…"):
+            df_tess = query_mast(
+                coord.ra.deg, coord.dec.deg,
+                radius_arcmin, "TESS", max_results,
+            )
+
+        if df_tess.empty:
+            st.info("No TESS observations found for this target / radius.")
+        else:
+            display_cols = [c for c in [
+                "target_name", "instrument_name", "filters",
+                "t_exptime", "obs_date", "proposal_id", "dataproduct_type", "calib_level",
+            ] if c in df_tess.columns]
+            st.caption(f"{len(df_tess)} observations returned")
+            st.dataframe(df_tess[display_cols], use_container_width=True, hide_index=True)
+
+        # Light curve
+        st.markdown("#### Light Curve (TESS via lightkurve)")
+        with st.spinner("Searching for light curves…"):
+            try:
+                lc_meta = search_lightcurve_meta(target_input.strip())
+            except Exception as e:
+                lc_meta = pd.DataFrame()
+                st.warning(f"lightkurve search error: {e}")
+
+        if not lc_meta.empty:
+            with st.expander("Light curve search results"):
+                st.dataframe(lc_meta, use_container_width=True, hide_index=True)
+
+        lc = None
+        with st.spinner("Downloading light curve…"):
+            try:
+                lc = fetch_lightcurve(target_input.strip())
+            except Exception as e:
+                st.warning(f"lightkurve download error: {e}")
+
+        if lc is not None:
+
+            fig, ax = plt.subplots(figsize=(10, 3))
+            lc.scatter(ax=ax, s=1, c="steelblue")
+            ax.set_title(f"TESS light curve — {target_input}")
+            ax.set_xlabel("Time (BTJD)")
+            ax.set_ylabel("Flux")
+            fig.tight_layout()
+            st.pyplot(fig)
+            plt.close(fig)
+        else:
+            st.info(
+                "No TESS light curve found via lightkurve for this target name. "
+                "Try an exact catalogue name (e.g. 'TRAPPIST-1' or 'TIC 278683025')."
+            )
+
+else:
+    st.info("Enter a target in the sidebar and press **Search** to begin.")
+
+# ── Footer ────────────────────────────────────────────────────────────────────
+st.divider()
+st.caption(
+    "Data from [MAST](https://mast.stsci.edu) · "
+    "Powered by [astroquery](https://astroquery.readthedocs.io) & "
+    "[lightkurve](https://lightkurve.github.io/lightkurve/)"
 )
-features = resp.json()["features"]
-
-rows = []
-for feat in features:
-    cloud = feat["properties"].get("eo:cloud_cover")
-    if cloud is not None and cloud > params["max_cloud_pct"]:
-        continue
-    for name, asset in feat["assets"].items():
-        href = asset.get("href", "")
-        rows.append({{
-            "item_id":   feat["id"],
-            "datetime":  feat["properties"].get("datetime", "")[:10],
-            "asset":     name,
-            "s3_href":   href,
-            "https_url": href.replace(f"s3://{{S3_BUCKET}}/", f"{{S3_HTTP_BASE}}/"),
-            "cloud_pct": cloud,
-        }})
-
-df = pd.DataFrame(rows)
-print(f"{{df['item_id'].nunique()}} scenes / {{len(df)}} assets")
-df[["item_id", "datetime", "asset", "https_url"]].head(10)
-'''
-            st.code(code, language="python")
-
-    else:
-        render_sidebar()
-        st.markdown("""
-        ### How it works
-
-        1. **Type a question** about the Australian landscape
-        2. **Claude parses** the question into a location, date range, and recommended DEA collection(s)
-        3. **Nominatim geocodes** the location to a bounding box
-        4. **DEA STAC API** returns matching satellite scenes
-        5. You get **HTTPS-accessible S3 URLs** for every asset — ready to download or use in analysis
-
-        Results include a map of scene footprints, a filterable table, direct asset URLs, and
-        copy-paste Python code to reproduce the search.
-        """)
-
-
-if __name__ == "__main__":
-    main()
