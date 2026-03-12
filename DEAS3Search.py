@@ -542,35 +542,36 @@ def main():
         )
 
     # ── Input ──
-    # Initialise question value from session state so example buttons can populate it
-    if "question" not in st.session_state:
-        st.session_state["question"] = ""
+    # "question_text" is the single source of truth for the text area content.
+    # Example buttons write here then rerun; the text_area key reads from it.
+    if "question_text" not in st.session_state:
+        st.session_state["question_text"] = ""
+
+    # ── Example questions (above the box so clicking feels natural) ──
+    st.caption("Examples — click any to load into the search box:")
+    ex_cols = st.columns(4)
+    for i, ex in enumerate(EXAMPLE_QUESTIONS):
+        label = ex[:52] + ("…" if len(ex) > 52 else "")
+        if ex_cols[i % 4].button(label, key=f"ex_{i}", use_container_width=True):
+            st.session_state["question_text"] = ex
+            st.rerun()
 
     col1, col2 = st.columns([3, 1])
     with col1:
-        question = st.text_area(
+        # key= binds the widget to session_state["question_text"] automatically
+        st.text_area(
             "Your question",
-            value=st.session_state["question"],
             placeholder="e.g. Find areas in the QPRC LGA affected by 2022 bushfires",
             height=100,
             label_visibility="collapsed",
-            key="question_input",
+            key="question_text",
         )
-        # Keep session state in sync with manual edits
-        st.session_state["question"] = question
     with col2:
         st.markdown("<br>", unsafe_allow_html=True)
         search_clicked = st.button("🔍 Search", use_container_width=True, type="primary")
         max_results = st.slider("Max scenes", 5, 100, 20, step=5)
 
-    # ── Example questions ──
-    st.caption("Examples — click to populate the search box:")
-    cols = st.columns(4)
-    for i, ex in enumerate(EXAMPLE_QUESTIONS):
-        label = ex[:52] + ("…" if len(ex) > 52 else "")
-        if cols[i % 4].button(label, key=f"ex_{i}", use_container_width=True):
-            st.session_state["question"] = ex
-            st.rerun()
+    question = st.session_state["question_text"]
 
     # ── Run search ──
     if search_clicked and question.strip():
