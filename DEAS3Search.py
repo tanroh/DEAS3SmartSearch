@@ -510,16 +510,23 @@ def render_sidebar(active_collection_ids: list = None):
 def main():
     st.markdown("""
     <style>
-    .stApp { background: #050e05; }
-    h1,h2,h3 { color: #c8e6c8 !important; }
-    .stTextArea textarea { background: #0a160a !important; color: #c8e6c8 !important;
-        border: 1px solid #2a4a2a !important; font-family: monospace; }
-    .stButton button { background: #1a3a1a !important; color: #c8ffc8 !important;
-        border: 1px solid #3a6a3a !important; }
-    .stButton button:hover { background: #2a5a2a !important; }
-    .stDataFrame { background: #0a160a !important; }
-    div[data-testid="stExpander"] { background: #080f08; border: 1px solid #1a2e1a; border-radius: 6px; }
-    .stMetric { background: #080f08; border: 1px solid #1a2e1a; border-radius: 6px; padding: 8px; }
+    /* Style example buttons as small pill-shaped tags */
+    section[data-testid="stMain"] div[data-testid="stHorizontalBlock"] button[kind="secondary"] {
+        background: transparent !important;
+        border: 1px solid rgba(150,150,150,0.4) !important;
+        border-radius: 999px !important;
+        font-size: 0.75rem !important;
+        padding: 0.2rem 0.6rem !important;
+        white-space: normal !important;
+        text-align: left !important;
+        line-height: 1.3 !important;
+        height: auto !important;
+        min-height: unset !important;
+    }
+    section[data-testid="stMain"] div[data-testid="stHorizontalBlock"] button[kind="secondary"]:hover {
+        border-color: rgba(150,150,150,0.8) !important;
+        background: rgba(150,150,150,0.08) !important;
+    }
     </style>
     """, unsafe_allow_html=True)
 
@@ -535,30 +542,35 @@ def main():
         )
 
     # ── Input ──
+    # Initialise question value from session state so example buttons can populate it
+    if "question" not in st.session_state:
+        st.session_state["question"] = ""
+
     col1, col2 = st.columns([3, 1])
     with col1:
         question = st.text_area(
             "Your question",
+            value=st.session_state["question"],
             placeholder="e.g. Find areas in the QPRC LGA affected by 2022 bushfires",
-            height=80,
+            height=100,
             label_visibility="collapsed",
+            key="question_input",
         )
+        # Keep session state in sync with manual edits
+        st.session_state["question"] = question
     with col2:
         st.markdown("<br>", unsafe_allow_html=True)
-        search_clicked = st.button("🔍 Search", use_container_width=True)
+        search_clicked = st.button("🔍 Search", use_container_width=True, type="primary")
         max_results = st.slider("Max scenes", 5, 100, 20, step=5)
 
     # ── Example questions ──
-    st.markdown("**Examples:**")
+    st.caption("Examples — click to populate the search box:")
     cols = st.columns(4)
     for i, ex in enumerate(EXAMPLE_QUESTIONS):
-        label = ex[:48] + ("…" if len(ex) > 48 else "")
+        label = ex[:52] + ("…" if len(ex) > 52 else "")
         if cols[i % 4].button(label, key=f"ex_{i}", use_container_width=True):
-            st.session_state["prefill"] = ex
+            st.session_state["question"] = ex
             st.rerun()
-
-    if "prefill" in st.session_state:
-        question = st.session_state.pop("prefill")
 
     # ── Run search ──
     if search_clicked and question.strip():
