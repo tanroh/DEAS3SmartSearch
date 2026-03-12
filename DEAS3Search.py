@@ -174,9 +174,16 @@ def geocode_place(place_name: str, buffer_deg: float = 0.5) -> dict:
     queries = [place_name]
     if not place_name.lower().endswith("australia"):
         queries.append(place_name + ", Australia")
-    if any(kw in place_name.lower() for kw in ["lga", "council", "shire", "regional"]):
-        for state in ["NSW", "VIC", "QLD", "SA", "WA", "TAS", "NT", "ACT"]:
-            queries.append(f"{place_name}, {state}, Australia")
+
+    # Strip administrative suffixes that confuse Nominatim, then retry
+    stripped = re.sub(
+        r'\b(Regional Council|City Council|Shire Council|Council|'
+        r'Local Government Area|LGA|Shire|Region|District)\b',
+        "", place_name, flags=re.IGNORECASE,
+    ).strip(" ,")
+    if stripped and stripped.lower() != place_name.lower():
+        queries.append(stripped)
+        queries.append(stripped + ", Australia")
 
     data = []
     last_error = None
@@ -230,7 +237,14 @@ SYSTEM_PROMPT = (
     "Extract search parameters from the user's question. "
     "Respond ONLY with valid JSON — no markdown fences, no commentary:\n"
     "{\n"
-    '  "place_name": "<location exactly as the user wrote it, including acronyms like QPRC LGA — or null if none mentioned>",\n'
+    '  "place_name": "<full resolvable place name — ALWAYS expand acronyms and abbreviations '
+    'to their full geocodable form. Examples: QPRC -> Queanbeyan-Palerang, '
+    'MDB -> Murray-Darling Basin, SEQ -> South East Queensland, '
+    'FNQ -> Far North Queensland, SWWA -> South West Western Australia, '
+    'ACT -> Australian Capital Territory, NQ -> North Queensland. '
+    'Drop suffixes that confuse geocoders: LGA, Local Government Area, '
+    'Regional Council, City Council, Shire Council. '
+    'Return null if no location is mentioned.>",\n'
     '  "start_date": "<YYYY-MM-DD>",\n'
     '  "end_date": "<YYYY-MM-DD>",\n'
     '  "collections": ["<collection_id>"],\n'
@@ -238,7 +252,9 @@ SYSTEM_PROMPT = (
     '  "reasoning": "<one sentence>"\n'
     "}\n"
     "Rules:\n"
-    "- Preserve place names exactly as written — do NOT simplify or generalise them\n"
+    "- ALWAYS expand location acronyms/abbreviations to their full geocodable name\n"
+    "- ALWAYS drop administrative suffixes: LGA, Local Government Area, Regional Council, "
+    "City Council, Shire Council\n"
     "- If no specific location is mentioned, set place_name to null\n"
     "- Pick 1-2 most relevant collection IDs from the catalogue provided\n"
     "- Default to last 12 months if no date mentioned\n"
