@@ -172,6 +172,7 @@ def get_ai_client():
 @st.cache_data(ttl=3600, show_spinner=False)
 def geocode_place(place_name: str, buffer_deg: float = 0.5) -> dict:
     """Convert a place name to a WGS84 bounding box via Nominatim REST API."""
+    data = []
     for attempt in range(3):
         try:
             resp = requests.get(
