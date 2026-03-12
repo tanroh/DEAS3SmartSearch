@@ -410,27 +410,60 @@ def stac_search(collection: str, bbox: list, start_date: str, end_date: str,
     return resp.json().get("features", [])
 
 
+def _to_https(href: str) -> str:
+    """Convert an s3:// href to a public HTTPS URL."""
+    if href.startswith("s3://"):
+        return href.replace(f"s3://{S3_BUCKET}/", f"{S3_HTTP_BASE}/")
+    return href
+
+
+def get_thumbnail_url(feature: dict) -> str:
+    """
+    Extract the thumbnail HTTPS URL from a STAC feature.
+    DEA uses the asset key 'thumbnail'; falls back to checking roles.
+    Returns None if not available.
+    """
+    try:
+        assets = feature.get("assets", {})
+        # Try the standard 'thumbnail' key first
+        for key in ("thumbnail", "overview"):
+            if key in assets:
+                href = assets[key].get("href", "")
+                if href:
+                    return _to_https(href)
+        # Fall back: find any asset with role 'thumbnail'
+        for asset in assets.values():
+            if "thumbnail" in asset.get("roles", []):
+                href = asset.get("href", "")
+                if href:
+                    return _to_https(href)
+    except Exception:
+        pass
+    return None
+
+
 def build_asset_index(features: list, collection_id: str) -> pd.DataFrame:
     rows = []
     for feat in features:
-        item_id = feat["id"]
-        dt      = feat["properties"].get("datetime", "")
-        cloud   = feat["properties"].get("eo:cloud_cover")
-        bbox    = feat.get("bbox", [])
+        item_id       = feat["id"]
+        dt            = feat["properties"].get("datetime", "")
+        cloud         = feat["properties"].get("eo:cloud_cover")
+        bbox          = feat.get("bbox", [])
+        thumbnail_url = get_thumbnail_url(feat)
         for asset_name, asset in feat.get("assets", {}).items():
             href = asset.get("href", "")
-            https_url = (href.replace(f"s3://{S3_BUCKET}/", f"{S3_HTTP_BASE}/")
-                         if href.startswith("s3://") else href)
+            https_url = _to_https(href)
             rows.append({
-                "item_id":    item_id,
-                "datetime":   dt[:10] if dt else "",
-                "collection": collection_id,
-                "cloud_pct":  cloud,
-                "asset":      asset_name,
-                "media_type": asset.get("type", ""),
-                "s3_href":    href,
-                "https_url":  https_url,
-                "bbox_str":   str(bbox),
+                "item_id":       item_id,
+                "datetime":      dt[:10] if dt else "",
+                "collection":    collection_id,
+                "cloud_pct":     cloud,
+                "asset":         asset_name,
+                "media_type":    asset.get("type", ""),
+                "s3_href":       href,
+                "https_url":     https_url,
+                "thumbnail_url": thumbnail_url,
+                "bbox_str":      str(bbox),
             })
     return pd.DataFrame(rows)
 
@@ -658,18 +691,48 @@ def main():
                                "dea_results.csv", "text/csv")
 
         with tab_urls:
-            st.markdown("**HTTPS-accessible S3 asset URLs** — click to open/download directly.")
+            st.markdown("**HTTPS-accessible S3 asset URLs** — click any filename to open/download.")
             unique_items = results["item_id"].unique()
             for item_id in unique_items[:30]:
                 item_rows = results[results["item_id"] == item_id]
-                dt = item_rows["datetime"].iloc[0]
-                cloud = item_rows["cloud_pct"].iloc[0]
+                dt        = item_rows["datetime"].iloc[0]
+                cloud     = item_rows["cloud_pct"].iloc[0]
                 cloud_str = f" · ☁ {cloud:.0f}%" if pd.notna(cloud) else ""
+                thumb_url = item_rows["thumbnail_url"].iloc[0]
+
                 with st.expander(f"📦 {item_id}  ({dt}{cloud_str})"):
-                    for _, row in item_rows.iterrows():
-                        url = row["https_url"]
-                        if url:
-                            st.markdown(f"`{row['asset']:30s}` [{url.split('/')[-1]}]({url})")
+                    # ── Thumbnail preview ──
+                    if thumb_url:
+                        try:
+                            resp = requests.head(thumb_url, timeout=5)
+                            if resp.status_code == 200:
+                                col_img, col_links = st.columns([1, 2])
+                                with col_img:
+                                    st.image(thumb_url, caption="Quicklook", use_container_width=True)
+                                with col_links:
+                                    for _, row in item_rows.iterrows():
+                                        url = row["https_url"]
+                                        if url and row["asset"] != "thumbnail":
+                                            st.markdown(f"`{row['asset']:30s}` [{url.split('/')[-1]}]({url})")
+                            else:
+                                st.caption("🖼 Thumbnail not available for this scene.")
+                                for _, row in item_rows.iterrows():
+                                    url = row["https_url"]
+                                    if url:
+                                        st.markdown(f"`{row['asset']:30s}` [{url.split('/')[-1]}]({url})")
+                        except Exception:
+                            st.caption("🖼 Thumbnail could not be loaded.")
+                            for _, row in item_rows.iterrows():
+                                url = row["https_url"]
+                                if url:
+                                    st.markdown(f"`{row['asset']:30s}` [{url.split('/')[-1]}]({url})")
+                    else:
+                        st.caption("🖼 No thumbnail asset for this scene.")
+                        for _, row in item_rows.iterrows():
+                            url = row["https_url"]
+                            if url:
+                                st.markdown(f"`{row['asset']:30s}` [{url.split('/')[-1]}]({url})")
+
             if len(unique_items) > 30:
                 st.caption(f"Showing first 30 of {len(unique_items)} scenes. Download CSV for all.")
 
