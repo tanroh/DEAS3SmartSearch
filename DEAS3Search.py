@@ -164,36 +164,67 @@ def get_ai_client():
     return anthropic.Anthropic(api_key=api_key)
 
 # ── Geocoding ─────────────────────────────────────────────────────────────────
-@st.cache_data(ttl=3600, show_spinner=False)
-def geocode_place(place_name: str, buffer_deg: float = 0.5) -> dict:
-    """
-    Convert a place name to a WGS84 bounding box.
-    Calls the Nominatim REST API directly with exponential backoff on 429s.
-    Tries progressively more specific query strings to maximise match rate.
-    """
-    queries = [place_name]
+def _build_query_variants(place_name: str) -> list:
+    """Return query strings to try, from most to least specific."""
+    variants = [place_name]
     if not place_name.lower().endswith("australia"):
-        queries.append(place_name + ", Australia")
-
-    # Strip administrative suffixes that confuse Nominatim, then retry
+        variants.append(place_name + ", Australia")
+    # Strip suffixes that confuse geocoders
     stripped = re.sub(
         r'\b(Regional Council|City Council|Shire Council|Council|'
         r'Local Government Area|LGA|Shire|Region|District)\b',
         "", place_name, flags=re.IGNORECASE,
     ).strip(" ,")
     if stripped and stripped.lower() != place_name.lower():
-        queries.append(stripped)
-        queries.append(stripped + ", Australia")
+        variants.append(stripped)
+        variants.append(stripped + ", Australia")
+    return variants
 
-    data = []
-    last_error = None
 
-    for query in queries:
+def _geocode_geoapify(place_name: str, api_key: str) -> dict:
+    """Try Geoapify geocoding API. Returns result dict or None."""
+    for query in _build_query_variants(place_name):
+        try:
+            resp = requests.get(
+                "https://api.geoapify.com/v1/geocode/search",
+                params={
+                    "text": query,
+                    "filter": "countrycode:au",
+                    "limit": 1,
+                    "apiKey": api_key,
+                },
+                timeout=10,
+            )
+            resp.raise_for_status()
+            features = resp.json().get("features", [])
+            if features:
+                f = features[0]
+                props = f["properties"]
+                lon, lat = f["geometry"]["coordinates"]
+                bb = props.get("bbox")
+                if bb:
+                    bbox = [bb[0], bb[1], bb[2], bb[3]]
+                else:
+                    bbox = [lon - 0.5, lat - 0.5, lon + 0.5, lat + 0.5]
+                return {
+                    "place":    props.get("formatted", place_name),
+                    "bbox":     bbox,
+                    "centroid": [lon, lat],
+                }
+        except Exception:
+            pass
+    return None
+
+
+def _geocode_nominatim(place_name: str) -> dict:
+    """Try Nominatim with retries and backoff. Returns result dict or None."""
+    for query in _build_query_variants(place_name):
         for attempt in range(3):
             try:
                 resp = requests.get(
                     "https://nominatim.openstreetmap.org/search",
-                    params={"q": query, "format": "json", "limit": 1, "addressdetails": 0},
+                    params={"q": query, "format": "json", "limit": 1,
+                            "addressdetails": 0, "countrycodes": "au"},
                     headers={"User-Agent": "dea-streamlit-search/1.0 rohan.tankey@gmail.com"},
                     timeout=10,
                 )
@@ -203,33 +234,48 @@ def geocode_place(place_name: str, buffer_deg: float = 0.5) -> dict:
                 resp.raise_for_status()
                 data = resp.json()
                 if data:
-                    break
-            except requests.RequestException as e:
-                last_error = e
+                    g = data[0]
+                    lon, lat = float(g["lon"]), float(g["lat"])
+                    if "boundingbox" in g:
+                        s, n, w, e = [float(v) for v in g["boundingbox"]]
+                        bbox = [w, s, e, n]
+                    else:
+                        bbox = [lon - 0.5, lat - 0.5, lon + 0.5, lat + 0.5]
+                    return {
+                        "place":    g.get("display_name", place_name),
+                        "bbox":     bbox,
+                        "centroid": [lon, lat],
+                    }
+            except requests.RequestException:
                 if attempt == 2:
                     break
                 time.sleep(2 ** attempt)
-        if data:
-            break
+    return None
 
-    if not data:
-        msg = f'Could not geocode "{place_name}"'
-        if last_error:
-            msg += f" ({last_error})"
-        raise ValueError(msg)
 
-    g = data[0]
-    centroid = [float(g["lon"]), float(g["lat"])]
+@st.cache_data(ttl=3600, show_spinner=False)
+def geocode_place(place_name: str) -> dict:
+    """
+    Convert a place name to a WGS84 bounding box.
+    Tries Geoapify first (if GEOAPIFY_API_KEY secret is set), falls back to Nominatim.
+    Add GEOAPIFY_API_KEY to Streamlit Secrets for reliable geocoding of Australian LGAs.
+    Free tier: https://www.geoapify.com/ (3,000 requests/day, no rate limiting issues).
+    """
+    geoapify_key = os.environ.get("GEOAPIFY_API_KEY", "")
 
-    if "boundingbox" in g:
-        s, n, w, e = [float(v) for v in g["boundingbox"]]
-        bbox = [w, s, e, n]
-    else:
-        lon, lat = centroid
-        bbox = [lon - buffer_deg, lat - buffer_deg,
-                lon + buffer_deg, lat + buffer_deg]
+    result = _geocode_geoapify(place_name, geoapify_key) if geoapify_key else None
 
-    return {"place": g.get("display_name", place_name), "bbox": bbox, "centroid": centroid}
+    if result is None:
+        result = _geocode_nominatim(place_name)
+
+    if result is None:
+        raise ValueError(
+            f'Could not geocode "{place_name}". '
+            "Add GEOAPIFY_API_KEY to Streamlit Secrets for more reliable geocoding "
+            "(free at geoapify.com — handles Australian LGAs and place names well)."
+        )
+
+    return result
 
 # ── Claude question parser ────────────────────────────────────────────────────
 SYSTEM_PROMPT = (
