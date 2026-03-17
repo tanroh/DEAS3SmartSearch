@@ -794,6 +794,8 @@ df[["item_id", "datetime", "asset", "https_url"]].head(10)
 
         Results include a map of scene footprints, a filterable table, direct asset URLs, and
         copy-paste Python code to reproduce the search.
+
+        Developed and deployed by Rohan Tankey, 2026
         """)
 
 
